@@ -1,0 +1,741 @@
+
+import json
+import os
+import re
+import sqlite3
+from typing import List
+
+import pandas as pd
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+def _init_sqlite_db(sql_text: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(sql_text)
+    return conn
+
+
+def _sql_select_only(sql: str) -> bool:
+    s = sql.strip().lower()
+    if not s:
+        return False
+    return s.startswith("select") or s.startswith("with")
+
+
+def _run_sql(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
+    return pd.read_sql_query(sql, conn)
+
+
+def _list_tables(conn: sqlite3.Connection) -> List[str]:
+    df = _run_sql(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;",
+    )
+    return df["name"].tolist() if not df.empty else []
+
+
+def _get_db_schema_summary(conn: sqlite3.Connection) -> str:
+    parts: list[str] = []
+    tables = _list_tables(conn)
+    parts.append("SQLite schema (tables and columns):")
+    for tname in tables:
+        safe_tname = tname.replace("'", "''")
+        cols = _run_sql(conn, f"PRAGMA table_info('{safe_tname}');")
+        if cols.empty:
+            continue
+        col_list = ", ".join(
+            [f"{row['name']} ({row['type']})" for _, row in cols.iterrows()]
+        )
+        parts.append(f"- {tname}: {col_list}")
+    return "\n".join(parts)
+
+
+def _ensure_limit(sql: str, limit: int = 200) -> str:
+    s = sql.strip().rstrip(";").strip()
+    if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
+        return s
+    return f"{s} LIMIT {int(limit)}"
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    m = re.search(r"\{[\s\S]*\}", t)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _openai_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
+    if not api_key:
+        return None, "Missing OPENAI_API_KEY environment variable."
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    system = (
+        "You are a careful data assistant that writes SQLite SELECT queries.\n"
+        "Rules:\n"
+        "- Output MUST be valid JSON, and ONLY JSON.\n"
+        '- JSON shape: {"sql": "...", "explanation": "..."}\n'
+        "- SQL must be SQLite-compatible.\n"
+        "- SQL must be READ-ONLY: SELECT (or WITH ... SELECT). Never write INSERT/UPDATE/DELETE/CREATE/DROP.\n"
+        "- Prefer joining tables using foreign keys when needed.\n"
+        "- If the question is ambiguous, make a reasonable assumption.\n"
+        "- Keep results concise: include LIMIT 50 unless the user asks otherwise.\n"
+    )
+    user = f"{schema_summary}\n\nUser question: {prompt}"
+
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=45)
+    except Exception as e:
+        return None, f"OpenAI request failed: {e}"
+
+    if resp.status_code >= 400:
+        return None, f"OpenAI error {resp.status_code}: {resp.text[:400]}"
+
+    data = resp.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    obj = _extract_first_json_object(content)
+    if not obj or "sql" not in obj:
+        return None, "OpenAI returned an unexpected response (could not parse JSON)."
+    return str(obj.get("sql") or "").strip(), str(obj.get("explanation") or "").strip()
+
+
+def _ollama_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str | None, str | None]:
+    url = "http://localhost:11434/api/generate"
+    system = (
+        "You write SQLite SELECT queries.\n"
+        'Return ONLY valid JSON: {"sql": "...", "explanation": "..."}\n'
+        "Constraints: read-only SELECT/WITH SELECT; SQLite compatible; use LIMIT 50 unless asked otherwise."
+    )
+    full_prompt = f"{system}\n\n{schema_summary}\n\nUser question: {prompt}\n\nJSON:"
+    payload = {"model": model, "prompt": full_prompt, "stream": False}
+    try:
+        resp = requests.post(url, json=payload, timeout=60)
+    except Exception as e:
+        return None, f"Ollama request failed: {e}"
+
+    if resp.status_code >= 400:
+        return None, f"Ollama error {resp.status_code}: {resp.text[:400]}"
+
+    data = resp.json()
+    content = str(data.get("response") or "").strip()
+    obj = _extract_first_json_object(content)
+    if not obj or "sql" not in obj:
+        return None, "Ollama returned an unexpected response (could not parse JSON)."
+    return str(obj.get("sql") or "").strip(), str(obj.get("explanation") or "").strip()
+
+
+def _gemini_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None, "Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable."
+
+    system = (
+        "You are a careful data assistant that writes SQLite SELECT queries.\n"
+        "Rules:\n"
+        "- Output MUST be valid JSON, and ONLY JSON.\n"
+        '- JSON shape: {"sql": "...", "explanation": "..."}\n'
+        "- SQL must be SQLite-compatible.\n"
+        "- SQL must be READ-ONLY: SELECT (or WITH ... SELECT). Never write INSERT/UPDATE/DELETE/CREATE/DROP.\n"
+        "- Prefer joining tables using foreign keys when needed.\n"
+        "- If the question is ambiguous, make a reasonable assumption.\n"
+        "- Keep results concise: include LIMIT 50 unless the user asks otherwise.\n"
+    )
+    text = f"{system}\n\n{schema_summary}\n\nUser question: {prompt}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": text}]}]}
+    try:
+        resp = requests.post(url, json=payload, timeout=45)
+    except Exception as e:
+        return None, f"Gemini request failed: {e}"
+    if resp.status_code >= 400:
+        return None, f"Gemini error {resp.status_code}: {resp.text[:400]}"
+    data = resp.json()
+    candidates = data.get("candidates", [])
+    content = ""
+    if candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if parts:
+            content = str(parts[0].get("text") or "")
+    obj = _extract_first_json_object(content)
+    if not obj or "sql" not in obj:
+        return None, "Gemini returned an unexpected response (could not parse JSON)."
+    return str(obj.get("sql") or "").strip(), str(obj.get("explanation") or "").strip()
+
+
+def _openai_summarize_answer(
+    question: str, sql: str, df: pd.DataFrame, model: str
+) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
+    if not api_key:
+        return None, "Missing OPENAI_API_KEY environment variable."
+
+    sample_records = df.head(30).to_dict(orient="records")
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a data analyst assistant. Write concise, readable answers in plain English.\n"
+                    "Use only the provided query results; do not invent facts.\n"
+                    "Prefer 4-8 bullet points and include concrete names/titles when possible."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {question}\n"
+                    f"SQL used: {sql}\n"
+                    f"Rows returned: {len(df)}\n"
+                    f"Columns: {', '.join(df.columns.tolist())}\n"
+                    f"Sample rows (up to 30): {json.dumps(sample_records, ensure_ascii=True)}\n\n"
+                    "Now provide a readable answer."
+                ),
+            },
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=45,
+        )
+    except Exception as e:
+        return None, f"OpenAI summary request failed: {e}"
+
+    if resp.status_code >= 400:
+        return None, f"OpenAI summary error {resp.status_code}: {resp.text[:400]}"
+
+    data = resp.json()
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return str(content or "").strip(), None
+
+
+def _ollama_summarize_answer(
+    question: str, sql: str, df: pd.DataFrame, model: str
+) -> tuple[str | None, str | None]:
+    sample_records = df.head(30).to_dict(orient="records")
+    prompt = (
+        "You are a data analyst assistant. Write concise, readable answers in plain English.\n"
+        "Use only the provided rows; do not invent facts.\n"
+        "Prefer 4-8 bullet points with concrete paper titles/datasets when available.\n\n"
+        f"User question: {question}\n"
+        f"SQL used: {sql}\n"
+        f"Rows returned: {len(df)}\n"
+        f"Columns: {', '.join(df.columns.tolist())}\n"
+        f"Sample rows (up to 30): {json.dumps(sample_records, ensure_ascii=True)}\n\n"
+        "Answer:"
+    )
+
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=60,
+        )
+    except Exception as e:
+        return None, f"Ollama summary request failed: {e}"
+
+    if resp.status_code >= 400:
+        return None, f"Ollama summary error {resp.status_code}: {resp.text[:400]}"
+
+    data = resp.json()
+    content = str(data.get("response") or "").strip()
+    return content, None
+
+
+def _gemini_summarize_answer(
+    question: str, sql: str, df: pd.DataFrame, model: str
+) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None, "Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable."
+
+    sample_records = df.head(30).to_dict(orient="records")
+    prompt = (
+        "You are a data analyst assistant. Write concise, readable answers in plain English.\n"
+        "Use only the provided query results; do not invent facts.\n"
+        "Prefer 4-8 bullet points and include concrete names/titles when possible.\n\n"
+        f"User question: {question}\n"
+        f"SQL used: {sql}\n"
+        f"Rows returned: {len(df)}\n"
+        f"Columns: {', '.join(df.columns.tolist())}\n"
+        f"Sample rows (up to 30): {json.dumps(sample_records, ensure_ascii=True)}\n\n"
+        "Now provide a readable answer."
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        resp = requests.post(url, json=payload, timeout=45)
+    except Exception as e:
+        return None, f"Gemini summary request failed: {e}"
+    if resp.status_code >= 400:
+        return None, f"Gemini summary error {resp.status_code}: {resp.text[:400]}"
+    data = resp.json()
+    candidates = data.get("candidates", [])
+    content = ""
+    if candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if parts:
+            content = str(parts[0].get("text") or "")
+    if not content:
+        return None, "Gemini summary returned empty content."
+    return content.strip(), None
+
+
+def _fallback_summary(question: str, df: pd.DataFrame) -> str:
+    lines = [f"Here’s what I found for: **{question}**", ""]
+    cols = set(df.columns.tolist())
+
+    if {"doi_title", "pub_date", "publisher", "field"}.issubset(cols):
+        for _, row in df.head(5).iterrows():
+            title = str(row.get("doi_title", "Untitled")).strip()
+            year = str(row.get("pub_date", "N/A")).strip()
+            publisher = str(row.get("publisher", "N/A")).strip()
+            field = str(row.get("field", "N/A")).strip()
+            lines.append(f"- **{title}** ({year})")
+            lines.append(f"  - Publisher: {publisher}")
+            lines.append(f"  - Field: {field}")
+            if "authors" in cols and str(row.get("authors", "")).strip():
+                lines.append(f"  - Authors: {str(row.get('authors')).strip()}")
+            if "methods" in cols and str(row.get("methods", "")).strip():
+                lines.append(f"  - Methods: {str(row.get('methods')).strip()}")
+            if "datasets" in cols and str(row.get("datasets", "")).strip():
+                lines.append(f"  - Datasets: {str(row.get('datasets')).strip()}")
+        return "\n".join(lines)
+
+    if "publisher" in cols and "paper_count" in cols:
+        lines.append("Most common publishers:")
+        for _, row in df.head(10).iterrows():
+            lines.append(f"- {row['publisher']}: {row['paper_count']} papers")
+        return "\n".join(lines)
+
+    lines.append("Top matching results:")
+    for _, row in df.head(5).iterrows():
+        pairs = [f"{k}: {row[k]}" for k in df.columns[:4]]
+        lines.append(f"- {' | '.join(pairs)}")
+    return "\n".join(lines)
+
+
+def _nl_to_sql(user_text: str) -> str | None:
+    t = user_text.strip()
+    if not t:
+        return None
+
+    low = t.lower()
+    safe_text = t.replace("'", "''")
+
+    # exact/manual prompts first
+    if "list" in low and "table" in low:
+        return "SELECT name AS table_name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+
+    if ("top" in low and "paper" in low) or ("best" in low and "paper" in low) or ("recent" in low and "paper" in low):
+        return (
+            "SELECT d.doi_address, d.doi_title, d.pub_date, d.publisher, d.field, "
+            "COUNT(DISTINCT da.author) AS author_count, "
+            "COALESCE(GROUP_CONCAT(DISTINCT da.author), '') AS authors, "
+            "COALESCE(GROUP_CONCAT(DISTINCT fm.m_name), '') AS methods, "
+            "COALESCE(GROUP_CONCAT(DISTINCT dt.d_name), '') AS datasets "
+            "FROM DOI d "
+            "LEFT JOIN DOI_AUTHOR da ON da.a_doi = d.doi_address "
+            "LEFT JOIN FUSION_METHOD fm ON fm.m_doi = d.doi_address "
+            "LEFT JOIN DATA dt ON dt.d_doi = d.doi_address "
+            "GROUP BY d.doi_address, d.doi_title, d.pub_date, d.publisher, d.field "
+            "ORDER BY d.pub_date DESC, author_count DESC, d.doi_title "
+            "LIMIT 5;"
+        )
+
+    if "summary" in low and "paper" in low:
+        return (
+            "SELECT d.doi_address, d.doi_title, d.pub_date, d.publisher, d.field, "
+            "COALESCE(GROUP_CONCAT(DISTINCT da.author), '') AS authors, "
+            "COALESCE(GROUP_CONCAT(DISTINCT fm.m_name), '') AS methods, "
+            "COALESCE(GROUP_CONCAT(DISTINCT dt.d_name), '') AS datasets "
+            "FROM DOI d "
+            "LEFT JOIN DOI_AUTHOR da ON da.a_doi = d.doi_address "
+            "LEFT JOIN FUSION_METHOD fm ON fm.m_doi = d.doi_address "
+            "LEFT JOIN DATA dt ON dt.d_doi = d.doi_address "
+            "GROUP BY d.doi_address, d.doi_title, d.pub_date, d.publisher, d.field "
+            "ORDER BY d.pub_date DESC, d.doi_title "
+            "LIMIT 10;"
+        )
+
+    if "publisher" in low and ("most" in low or "common" in low or "often" in low):
+        return (
+            "SELECT publisher, COUNT(*) AS paper_count "
+            "FROM DOI "
+            "GROUP BY publisher "
+            "ORDER BY paper_count DESC, publisher "
+            "LIMIT 10;"
+        )
+
+    if "recent" in low and "field" in low:
+        return (
+            "SELECT field, pub_date, COUNT(*) AS paper_count "
+            "FROM DOI "
+            "GROUP BY field, pub_date "
+            "ORDER BY pub_date DESC, paper_count DESC, field "
+            "LIMIT 20;"
+        )
+
+    if ("show" in low or "list" in low) and "dataset" in low and "method" not in low and "methods" not in low and "fused with" not in low and "used with" not in low:
+        return (
+            "SELECT d_name AS dataset_name, d_type, spatial_coverage, temporal_coverage, format, license "
+            "FROM DATA WHERE d_name IS NOT NULL ORDER BY d_name;"
+        )
+
+    if "authors for" in low or "authors of" in low:
+        m = re.search(r"authors?\s+(for|of)\s+(10\.\S+)", t, flags=re.IGNORECASE)
+        if m:
+            doi = m.group(2).strip().replace("'", "''")
+            return (
+                "SELECT a.author "
+                "FROM DOI_AUTHOR a "
+                f"WHERE a.a_doi = '{doi}' "
+                "ORDER BY a.author;"
+            )
+
+    # simpler keyword-based fallback for demo questions
+    stopwords = {
+        "show", "me", "all", "list", "which", "what", "are", "is", "the", "for", "with",
+        "used", "use", "that", "report", "reports", "reporting", "commonly", "data",
+        "dataset", "datasets", "paper", "papers", "fusion", "method", "methods",
+        "uncertainty", "u2", "measurement", "of", "in", "on", "to"
+    }
+
+    raw_words = re.findall(r"[a-zA-Z0-9\-]+", low)
+    keywords = []
+    for word in raw_words:
+        if word not in stopwords and len(word) > 2:
+            keywords.append(word)
+
+    # intent detection
+    intent = None
+    if "method" in low:
+        intent = "methods"
+    elif "paper" in low:
+        intent = "papers"
+    elif "dataset" in low:
+        intent = "datasets"
+
+    if not intent:
+        if "author" in low:
+            intent = "authors"
+        elif "publisher" in low:
+            intent = "publishers"
+
+    if not keywords and intent not in {"publishers"}:
+        return None
+
+    def make_like_conditions(alias: str, include_paper_fields: bool = True) -> str:
+        parts = []
+        for k in keywords:
+            safe_k = k.replace("'", "''")
+            parts.append(f"{alias}.d_name LIKE '%{safe_k}%'")
+            parts.append(f"{alias}.collection_method LIKE '%{safe_k}%'")
+            if include_paper_fields:
+                parts.append(f"doi.doi_title LIKE '%{safe_k}%'")
+                parts.append(f"doi.abstract LIKE '%{safe_k}%'")
+                parts.append(f"doi.field LIKE '%{safe_k}%'")
+        return " OR ".join(parts) if parts else "1=1"
+
+    like_conditions = make_like_conditions("d")
+
+    # special case: methods used for a dataset/topic
+    if intent == "methods":
+        return f"""
+        SELECT DISTINCT fm.m_name AS fusion_method, d.d_name AS dataset_name, doi.doi_title
+        FROM DATA d
+        JOIN FUSION_METHOD fm ON fm.m_key = d.method_key
+        LEFT JOIN DOI doi ON doi.doi_address = d.d_doi
+        WHERE {like_conditions}
+        ORDER BY fm.m_name, d.d_name
+        """
+
+    # special case: papers asking about U2 / measurement uncertainty
+    if intent == "papers" and ("u2" in low or "measurement uncertainty" in low):
+        return f"""
+        SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name AS dataset_name, d.u2 AS measurement_uncertainty
+        FROM DOI doi
+        JOIN DATA d ON d.d_doi = doi.doi_address
+        WHERE d.u2 IS NOT NULL AND ({like_conditions})
+        ORDER BY doi.pub_date DESC, doi.doi_title
+        """
+
+    if intent == "papers":
+        return f"""
+        SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name AS dataset_name, doi.publisher, doi.field
+        FROM DOI doi
+        JOIN DATA d ON d.d_doi = doi.doi_address
+        WHERE {like_conditions}
+        ORDER BY doi.pub_date DESC, doi.doi_title
+        """
+
+    # special case: datasets commonly fused with X
+    if intent == "datasets" and ("fused with" in low or "used with" in low):
+        target_conditions = []
+        for k in keywords:
+            safe_k = k.replace("'", "''")
+            target_conditions.append(f"d_name LIKE '%{safe_k}%'")
+            target_conditions.append(f"collection_method LIKE '%{safe_k}%'")
+        target_where = " OR ".join(target_conditions) if target_conditions else "1=0"
+
+        return f"""
+        SELECT d1.d_name AS dataset_name,
+               COUNT(*) AS shared_method_count,
+               GROUP_CONCAT(DISTINCT fm.m_name) AS shared_methods
+        FROM DATA d1
+        JOIN FUSION_METHOD fm ON fm.m_key = d1.method_key
+        WHERE d1.method_key IN (
+            SELECT method_key
+            FROM DATA
+            WHERE {target_where}
+        )
+        AND d1.d_name IS NOT NULL
+        AND NOT ({target_where.replace("d_name", "d1.d_name").replace("collection_method", "d1.collection_method")})
+        GROUP BY d1.d_name
+        ORDER BY shared_method_count DESC, d1.d_name
+        """
+
+    if intent == "datasets":
+        return f"""
+        SELECT d.d_name AS dataset_name, COUNT(*) AS usage_count
+        FROM DATA d
+        LEFT JOIN DOI doi ON doi.doi_address = d.d_doi
+        WHERE {like_conditions}
+        GROUP BY d.d_name
+        ORDER BY usage_count DESC, d.d_name
+        """
+
+    if intent == "authors":
+        return f"""
+        SELECT DISTINCT da.author, doi.doi_title, doi.pub_date
+        FROM DOI_AUTHOR da
+        JOIN DOI doi ON doi.doi_address = da.a_doi
+        LEFT JOIN DATA d ON d.d_doi = doi.doi_address
+        WHERE {like_conditions}
+        ORDER BY da.author
+        """
+
+    if intent == "publishers":
+        return """
+        SELECT publisher, COUNT(*) AS paper_count
+        FROM DOI
+        GROUP BY publisher
+        ORDER BY paper_count DESC, publisher
+        LIMIT 10
+        """
+
+    return None
+
+
+def _scroll_to_latest_result():
+    components.html(
+        """
+        <script>
+            window.scrollTo({
+                top: document.body.scrollHeight,
+                behavior: "smooth"
+            });
+        </script>
+        """,
+        height=0,
+    )
+
+
+def render_sql_chat() -> None:
+    st.title("Scientific Knowledge System")
+    st.caption("Ask questions about the papers stored in the database.")
+
+    use_bundled = True
+    ai_enabled = False
+    provider = "Gemini"
+    model = "gemini-2.5-flash"
+    default_limit = 200
+
+    try:
+        with open("db.sql", "r", encoding="utf-8") as f:
+            sql_text = f.read()
+    except OSError:
+        st.error("Could not find db.sql in this project folder.")
+        st.info("Make sure your db.sql file is in the same folder as this Streamlit app.")
+        return
+
+    if "sql_conn" not in st.session_state or st.session_state.get("sql_source_hash") != hash(sql_text):
+        st.session_state["sql_conn"] = _init_sqlite_db(sql_text)
+        st.session_state["sql_source_hash"] = hash(sql_text)
+        st.session_state["chat_messages"] = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Hi! I’m your knowledge assistant. I can help you explore the papers, "
+                    "authors, datasets, methods, and publishers stored in this database.\n\n"
+                    "Try asking things like:\n"
+                    "- What are the most recent papers?\n"
+                    "- Which methods are used for a dataset?\n"
+                    "- Who are the authors for a paper?\n"
+                    "- Which publishers appear most often?"
+                ),
+            }
+        ]
+
+    conn: sqlite3.Connection = st.session_state["sql_conn"]
+    schema_summary = _get_db_schema_summary(conn)
+
+    for msg in st.session_state["chat_messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    st.markdown("### Suggested questions")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        qp1 = st.button("Recent papers", use_container_width=True)
+    with c2:
+        qp2 = st.button("Common publishers", use_container_width=True)
+    with c3:
+        qp3 = st.button("Methods by dataset", use_container_width=True)
+
+    quick_prompt = None
+    if qp1:
+        quick_prompt = "What are the most recent papers?"
+    elif qp2:
+        quick_prompt = "Which publishers appear most often?"
+    elif qp3:
+        quick_prompt = "Show methods used for datasets in the database."
+
+    user_prompt = st.chat_input("Ask about the scientific papers...")
+    if not user_prompt and not quick_prompt:
+        return
+    user_prompt = quick_prompt or user_prompt
+
+    st.session_state["chat_messages"].append({"role": "user", "content": user_prompt})
+    with st.chat_message("user"):
+        st.markdown(user_prompt)
+
+    with st.chat_message("assistant"):
+        raw = user_prompt.strip()
+        sql = None
+
+        if raw.lower().startswith("sql:"):
+            sql = raw[4:].strip()
+            if not _sql_select_only(sql):
+                response = "Only read-only SELECT queries are allowed."
+                st.markdown(response)
+                st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+                _scroll_to_latest_result()
+                return
+        else:
+            explanation = ""
+            if ai_enabled:
+                with st.spinner("Thinking..."):
+                    if provider == "OpenAI":
+                        sql, explanation = _openai_nl_to_sql(raw, schema_summary, model)
+                    elif provider == "Gemini":
+                        sql, explanation = _gemini_nl_to_sql(raw, schema_summary, model)
+                    else:
+                        sql, explanation = _ollama_nl_to_sql(raw, schema_summary, model)
+
+                if not sql:
+                    sql = _nl_to_sql(raw)
+
+                if sql and not _sql_select_only(sql):
+                    sql = _nl_to_sql(raw)
+
+                if sql:
+                    sql = _ensure_limit(sql, int(default_limit))
+            else:
+                sql = _nl_to_sql(raw)
+
+        if not sql:
+            response = (
+                "I couldn’t understand that question yet. Try asking about recent papers, "
+                "authors, datasets, methods, or publishers."
+            )
+            st.markdown(response)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+            _scroll_to_latest_result()
+            return
+
+        try:
+            df = _run_sql(conn, sql)
+        except Exception as e:
+            response = f"I ran into a problem searching the paper database: {e}"
+            st.markdown(response)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+            _scroll_to_latest_result()
+            return
+
+        if df.empty:
+            response = "I couldn’t find any matching papers or records for that question."
+            st.markdown(response)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+            _scroll_to_latest_result()
+            return
+
+        if len(df) > int(default_limit):
+            df = df.head(int(default_limit))
+
+        summary_text: str | None = None
+        summary_err: str | None = None
+
+        if ai_enabled:
+            with st.spinner("Writing answer..."):
+                if provider == "OpenAI":
+                    summary_text, summary_err = _openai_summarize_answer(raw, sql, df, model)
+                elif provider == "Gemini":
+                    summary_text, summary_err = _gemini_summarize_answer(raw, sql, df, model)
+                else:
+                    summary_text, summary_err = _ollama_summarize_answer(raw, sql, df, model)
+
+        if not summary_text:
+            if summary_err:
+                st.caption(f"Summary fallback: {summary_err}")
+            summary_text = _fallback_summary(raw, df)
+
+        st.markdown(summary_text)
+        st.session_state["chat_messages"].append({"role": "assistant", "content": summary_text})
+        _scroll_to_latest_result()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Scientific Knowledge System", layout="centered")
+    render_sql_chat()
+
+
+if __name__ == "__main__":
+    main()
