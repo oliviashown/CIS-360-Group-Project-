@@ -5,7 +5,7 @@ CREATE TABLE DOI (
     pub_date varchar(10),
     doi_url varchar(100),
     -- keywords
-    abstract varchar(200),
+    abstract TEXT,
     publisher varchar(20),
     field varchar(50)
 );
@@ -13,9 +13,9 @@ CREATE TABLE FUSION_METHOD (
     m_name varchar(100),
     m_key varchar(100) PRIMARY KEY,
     m_doi varchar(70),
-    m_desc varchar(200),
-    u1 varchar(100),
-    u3 varchar(100)
+    m_desc TEXT,
+    u1 TEXT,
+    u3 TEXT
 );
 
 CREATE TABLE DATA (
@@ -25,7 +25,7 @@ CREATE TABLE DATA (
   method_key varchar(100),
   d_type varchar(50),
   collection_method varchar(50),
-  u2 varchar(70),
+  u2 TEXT,
   spatial_coverage varchar(25),
   temporal_coverage varchar(25),
   format varchar(10),

@@ -98,6 +98,8 @@ def _openai_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str
         "- SQL must be READ-ONLY: SELECT (or WITH ... SELECT). Never write INSERT/UPDATE/DELETE/CREATE/DROP.\n"
         "- Prefer joining tables using foreign keys when needed.\n"
         "- If the question is ambiguous, make a reasonable assumption.\n"
+        "- Uncertainty Types: U1 is Conceptual (FUSION_METHOD), U2 is Measurement (DATA), U3 is Algorithmic (FUSION_METHOD).\n"
+        "- Linkage: Join DOI, DATA, and FUSION_METHOD using doi_address, d_doi, and m_doi.\n"
         "- Keep results concise: include LIMIT 50 unless the user asks otherwise.\n"
     )
     user = f"{schema_summary}\n\nUser question: {prompt}"
@@ -137,6 +139,7 @@ def _ollama_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str
         "You write SQLite SELECT queries.\n"
         'Return ONLY valid JSON: {"sql": "...", "explanation": "..."}\n'
         "Constraints: read-only SELECT/WITH SELECT; SQLite compatible; use LIMIT 50 unless asked otherwise."
+        "Note: U1/U3 are in FUSION_METHOD, U2 is in DATA. Join on DOI.doi_address."
     )
     full_prompt = f"{system}\n\n{schema_summary}\n\nUser question: {prompt}\n\nJSON:"
     payload = {"model": model, "prompt": full_prompt, "stream": False}
@@ -170,6 +173,8 @@ def _gemini_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str
         "- SQL must be READ-ONLY: SELECT (or WITH ... SELECT). Never write INSERT/UPDATE/DELETE/CREATE/DROP.\n"
         "- Prefer joining tables using foreign keys when needed.\n"
         "- If the question is ambiguous, make a reasonable assumption.\n"
+        "- Schema Help: DOI (papers), DATA (datasets/U2), FUSION_METHOD (methods/U1/U3).\n"
+        "- Link via DOI.doi_address = DATA.d_doi = FUSION_METHOD.m_doi.\n"
         "- Keep results concise: include LIMIT 50 unless the user asks otherwise.\n"
     )
     text = f"{system}\n\n{schema_summary}\n\nUser question: {prompt}"
@@ -331,12 +336,39 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
             lines.append(f"- **{title}** ({year})")
             lines.append(f"  - Publisher: {publisher}")
             lines.append(f"  - Field: {field}")
+            if "abstract" in cols and str(row.get("abstract", "")).strip():
+                abstract = str(row.get("abstract"))
+                lines.append(f"  - *Abstract*: {abstract[:500]}..." if len(abstract) > 500 else f"  - *Abstract*: {abstract}")
             if "authors" in cols and str(row.get("authors", "")).strip():
                 lines.append(f"  - Authors: {str(row.get('authors')).strip()}")
-            if "methods" in cols and str(row.get("methods", "")).strip():
-                lines.append(f"  - Methods: {str(row.get('methods')).strip()}")
-            if "datasets" in cols and str(row.get("datasets", "")).strip():
-                lines.append(f"  - Datasets: {str(row.get('datasets')).strip()}")
+            if "m_name" in cols and str(row.get("m_name", "")).strip():
+                lines.append(f"  - Method: {row['m_name']}")
+                if "m_desc" in cols and str(row.get("m_desc", "")).strip():
+                    lines.append(f"    - *Desc*: {row['m_desc']}")
+            if "d_name" in cols and str(row.get("d_name", "")).strip():
+                lines.append(f"  - Dataset: {row['d_name']}")
+            if "u1" in cols and row.get("u1"):
+                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+            if "u2" in cols and row.get("u2"):
+                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+            if "u3" in cols and row.get("u3"):
+                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+        return "\n".join(lines)
+
+    if "d_name" in cols:
+        lines.append("Matching Datasets:")
+        for _, row in df.head(10).iterrows():
+            lines.append(f"- **{row['d_name']}**")
+            if "collection_method" in cols and row["collection_method"]:
+                lines.append(f"  - Collection: {row['collection_method']}")
+            if "u2" in cols and row["u2"]:
+                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+            if "u1" in cols and row.get("u1"):
+                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+            if "u3" in cols and row.get("u3"):
+                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            if "d_type" in cols and row["d_type"]:
+                lines.append(f"  - Type: {row['d_type']}")
         return "\n".join(lines)
 
     if "publisher" in cols and "paper_count" in cols:
@@ -347,7 +379,7 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
 
     lines.append("Top matching results:")
     for _, row in df.head(5).iterrows():
-        pairs = [f"{k}: {row[k]}" for k in df.columns[:4]]
+        pairs = [f"**{k}**: {row[k]}" for k in df.columns if row[k] is not None]
         lines.append(f"- {' | '.join(pairs)}")
     return "\n".join(lines)
 
@@ -363,6 +395,19 @@ def _nl_to_sql(user_text: str) -> str | None:
     # exact/manual prompts first
     if "list" in low and "table" in low:
         return "SELECT name AS table_name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+
+    # STAKEHOLDER QUERY: Discovery (Most popular dataset by distinct methods)
+    if "most popular dataset" in low or "dataset with most methods" in low:
+        return """
+        SELECT d.d_name AS dataset_name, COUNT(DISTINCT d.method_key) AS unique_methods_count, 
+               GROUP_CONCAT(DISTINCT fm.m_name) AS method_list
+        FROM DATA d
+        LEFT JOIN FUSION_METHOD fm ON fm.m_key = d.method_key
+        WHERE d.d_name IS NOT NULL AND d.method_key IS NOT NULL
+        GROUP BY d.d_name
+        ORDER BY unique_methods_count DESC, d.d_name
+        LIMIT 1;
+        """
 
     if ("top" in low and "paper" in low) or ("best" in low and "paper" in low) or ("recent" in low and "paper" in low):
         return (
@@ -420,7 +465,7 @@ def _nl_to_sql(user_text: str) -> str | None:
         )
 
     if "authors for" in low or "authors of" in low:
-        m = re.search(r"authors?\s+(for|of)\s+(10\.\S+)", t, flags=re.IGNORECASE)
+        m = re.search(r"authors?\s+(?:for|of)\s+(10\.\S+)", t, flags=re.IGNORECASE)
         if m:
             doi = m.group(2).strip().replace("'", "''")
             return (
@@ -434,8 +479,9 @@ def _nl_to_sql(user_text: str) -> str | None:
     stopwords = {
         "show", "me", "all", "list", "which", "what", "are", "is", "the", "for", "with",
         "used", "use", "that", "report", "reports", "reporting", "commonly", "data",
-        "dataset", "datasets", "paper", "papers", "fusion", "method", "methods",
-        "uncertainty", "u2", "measurement", "of", "in", "on", "to"
+        "dataset", "datasets", "paper", "papers", "fusion", "method", "methods", "tell",
+        "uncertainty", "u2", "of", "in", "on", "to", "database", "info",
+        "everything", "find", "search", "about"
     }
 
     raw_words = re.findall(r"[a-zA-Z0-9\-]+", low)
@@ -450,7 +496,7 @@ def _nl_to_sql(user_text: str) -> str | None:
         intent = "methods"
     elif "paper" in low:
         intent = "papers"
-    elif "dataset" in low:
+    elif "dataset" in low or "most popular" in low:
         intent = "datasets"
 
     if not intent:
@@ -459,88 +505,66 @@ def _nl_to_sql(user_text: str) -> str | None:
         elif "publisher" in low:
             intent = "publishers"
 
-    if not keywords and intent not in {"publishers"}:
+    # If no specific intent is found but keywords exist, default to a broad search
+    if not intent and keywords:
+        intent = "general"
+    elif not keywords and not intent:
         return None
 
-    def make_like_conditions(alias: str, include_paper_fields: bool = True) -> str:
+    def make_like_conditions(aliases: list[str]) -> str:
         parts = []
         for k in keywords:
             safe_k = k.replace("'", "''")
-            parts.append(f"{alias}.d_name LIKE '%{safe_k}%'")
-            parts.append(f"{alias}.collection_method LIKE '%{safe_k}%'")
-            if include_paper_fields:
+            if "d" in aliases:
+                parts.append(f"d.d_name LIKE '%{safe_k}%'")
+                parts.append(f"d.collection_method LIKE '%{safe_k}%'")
+            if "doi" in aliases:
                 parts.append(f"doi.doi_title LIKE '%{safe_k}%'")
                 parts.append(f"doi.abstract LIKE '%{safe_k}%'")
                 parts.append(f"doi.field LIKE '%{safe_k}%'")
+            if "fm" in aliases:
+                parts.append(f"fm.m_name LIKE '%{safe_k}%'")
+                parts.append(f"fm.m_desc LIKE '%{safe_k}%'")
         return " OR ".join(parts) if parts else "1=1"
 
-    like_conditions = make_like_conditions("d")
+    like_conds = make_like_conditions(["doi", "d", "fm"])
 
     # special case: methods used for a dataset/topic
     if intent == "methods":
-        return f"""
-        SELECT DISTINCT fm.m_name AS fusion_method, d.d_name AS dataset_name, doi.doi_title
-        FROM DATA d
-        JOIN FUSION_METHOD fm ON fm.m_key = d.method_key
-        LEFT JOIN DOI doi ON doi.doi_address = d.d_doi
-        WHERE {like_conditions}
-        ORDER BY fm.m_name, d.d_name
-        """
+        return f"SELECT DISTINCT doi.doi_title, fm.m_name, fm.m_desc, fm.u1, fm.u3, d.d_name FROM FUSION_METHOD fm JOIN DOI doi ON fm.m_doi = doi.doi_address LEFT JOIN DATA d ON d.method_key = fm.m_key WHERE {like_conds} ORDER BY doi.pub_date DESC"
 
     # special case: papers asking about U2 / measurement uncertainty
     if intent == "papers" and ("u2" in low or "measurement uncertainty" in low):
-        return f"""
-        SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name AS dataset_name, d.u2 AS measurement_uncertainty
-        FROM DOI doi
-        JOIN DATA d ON d.d_doi = doi.doi_address
-        WHERE d.u2 IS NOT NULL AND ({like_conditions})
-        ORDER BY doi.pub_date DESC, doi.doi_title
-        """
+        return f"SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name, fm.u1, d.u2, fm.u3 FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE d.u2 IS NOT NULL AND ({like_conds}) ORDER BY doi.pub_date DESC"
 
     if intent == "papers":
-        return f"""
-        SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name AS dataset_name, doi.publisher, doi.field
-        FROM DOI doi
-        JOIN DATA d ON d.d_doi = doi.doi_address
-        WHERE {like_conditions}
-        ORDER BY doi.pub_date DESC, doi.doi_title
-        """
+        return f"SELECT DISTINCT doi.doi_title, doi.pub_date, doi.publisher, doi.field, doi.abstract FROM DOI doi WHERE {make_like_conditions(['doi'])} ORDER BY doi.pub_date DESC"
 
     # special case: datasets commonly fused with X
     if intent == "datasets" and ("fused with" in low or "used with" in low):
         target_conditions = []
         for k in keywords:
             safe_k = k.replace("'", "''")
-            target_conditions.append(f"d_name LIKE '%{safe_k}%'")
-            target_conditions.append(f"collection_method LIKE '%{safe_k}%'")
+            target_conditions.append(f"d1.d_name LIKE '%{safe_k}%'")
+            target_conditions.append(f"d1.collection_method LIKE '%{safe_k}%'")
+            target_conditions.append(f"doi.doi_title LIKE '%{safe_k}%'")
         target_where = " OR ".join(target_conditions) if target_conditions else "1=0"
 
         return f"""
-        SELECT d1.d_name AS dataset_name,
-               COUNT(*) AS shared_method_count,
-               GROUP_CONCAT(DISTINCT fm.m_name) AS shared_methods
+        SELECT DISTINCT d2.d_name AS fused_dataset, 
+               doi.doi_title AS source_paper,
+               fm.m_name AS fusion_method
         FROM DATA d1
-        JOIN FUSION_METHOD fm ON fm.m_key = d1.method_key
-        WHERE d1.method_key IN (
-            SELECT method_key
-            FROM DATA
-            WHERE {target_where}
-        )
-        AND d1.d_name IS NOT NULL
-        AND NOT ({target_where.replace("d_name", "d1.d_name").replace("collection_method", "d1.collection_method")})
-        GROUP BY d1.d_name
-        ORDER BY shared_method_count DESC, d1.d_name
+        JOIN DATA d2 ON d1.d_doi = d2.d_doi
+        JOIN DOI doi ON d1.d_doi = doi.doi_address
+        LEFT JOIN FUSION_METHOD fm ON fm.m_doi = doi.doi_address
+        WHERE ({target_where}) 
+          AND d1.d_name != d2.d_name
+        ORDER BY d2.d_name
         """
 
     if intent == "datasets":
-        return f"""
-        SELECT d.d_name AS dataset_name, COUNT(*) AS usage_count
-        FROM DATA d
-        LEFT JOIN DOI doi ON doi.doi_address = d.d_doi
-        WHERE {like_conditions}
-        GROUP BY d.d_name
-        ORDER BY usage_count DESC, d.d_name
-        """
+        return f"SELECT DISTINCT d.d_name, d.d_type, d.collection_method, fm.u1, d.u2, fm.u3, d.spatial_coverage FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE d.d_name IS NOT NULL AND ({like_conds}) ORDER BY d.d_name"
 
     if intent == "authors":
         return f"""
@@ -548,7 +572,8 @@ def _nl_to_sql(user_text: str) -> str | None:
         FROM DOI_AUTHOR da
         JOIN DOI doi ON doi.doi_address = da.a_doi
         LEFT JOIN DATA d ON d.d_doi = doi.doi_address
-        WHERE {like_conditions}
+        LEFT JOIN FUSION_METHOD fm ON fm.m_doi = doi.doi_address
+        WHERE {like_conds}
         ORDER BY da.author
         """
 
@@ -560,6 +585,9 @@ def _nl_to_sql(user_text: str) -> str | None:
         ORDER BY paper_count DESC, publisher
         LIMIT 10
         """
+
+    if intent == "general":
+        return f"SELECT DISTINCT doi.doi_title, doi.pub_date, doi.field, d.d_name, fm.m_name, fm.m_desc, fm.u1, d.u2, fm.u3 FROM DOI doi LEFT JOIN DATA d ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE {like_conds} ORDER BY doi.pub_date DESC LIMIT 20"
 
     return None
 
@@ -582,14 +610,19 @@ def render_sql_chat() -> None:
     st.title("Scientific Knowledge System")
     st.caption("Ask questions about the papers stored in the database.")
 
-    use_bundled = True
-    ai_enabled = False
-    provider = "Gemini"
-    model = "gemini-2.5-flash"
-    default_limit = 200
+    # Move configuration to sidebar for better UX
+    with st.sidebar:
+        st.header("Settings")
+        ai_enabled = st.checkbox("Enable AI (LLM)", value=False)
+        provider = st.selectbox("AI Provider", ["Gemini", "OpenAI", "Ollama"], index=0)
+        if provider == "Gemini":
+            model = st.text_input("Model Name", value="gemini-1.5-flash")
+        else:
+            model = st.text_input("Model Name", value="gpt-3.5-turbo" if provider == "OpenAI" else "llama3")
+        default_limit = st.number_input("Result Limit", value=200)
 
     try:
-        with open("db.sql", "r", encoding="utf-8") as f:
+        with open("sql_code/db.sql", "r", encoding="utf-8") as f:
             sql_text = f.read()
     except OSError:
         st.error("Could not find db.sql in this project folder.")
