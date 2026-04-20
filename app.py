@@ -610,16 +610,11 @@ def render_sql_chat() -> None:
     st.title("Scientific Knowledge System")
     st.caption("Ask questions about the papers stored in the database.")
 
-    # Move configuration to sidebar for better UX
-    with st.sidebar:
-        st.header("Settings")
-        ai_enabled = st.checkbox("Enable AI (LLM)", value=False)
-        provider = st.selectbox("AI Provider", ["Gemini", "OpenAI", "Ollama"], index=0)
-        if provider == "Gemini":
-            model = st.text_input("Model Name", value="gemini-1.5-flash")
-        else:
-            model = st.text_input("Model Name", value="gpt-3.5-turbo" if provider == "OpenAI" else "llama3")
-        default_limit = st.number_input("Result Limit", value=200)
+    # Hardcoded settings (sidebar removed)
+    ai_enabled = True
+    provider = "Gemini"
+    model = "gemini-1.5-flash"
+    default_limit = 10000  # High limit to effectively remove limits
 
     try:
         with open("sql_code/db.sql", "r", encoding="utf-8") as f:
