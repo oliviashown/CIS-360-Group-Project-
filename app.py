@@ -607,8 +607,72 @@ def _scroll_to_latest_result():
 
 
 def render_sql_chat() -> None:
-    st.title("Scientific Knowledge System")
-    st.caption("Ask questions about the papers stored in the database.")
+    # Custom CSS for better visual appeal
+    st.markdown("""
+    <style>
+    .main-header {
+        text-align: center;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 3em;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    .sub-header {
+        text-align: center;
+        color: #666;
+        font-size: 1.2em;
+        margin-bottom: 30px;
+    }
+    .chat-container {
+        border-radius: 10px;
+        padding: 10px;
+        margin: 10px 0;
+    }
+    .suggested-questions {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 20px;
+        margin: 20px 0;
+        border: 1px solid #e9ecef;
+    }
+    .suggested-questions h3 {
+        color: #495057;
+        text-align: center;
+        margin-bottom: 15px;
+    }
+    .stButton button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 10px 20px;
+        font-weight: bold;
+        transition: all 0.3s ease;
+    }
+    .stButton button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    .stChatMessage {
+        border-radius: 15px;
+        margin: 10px 0;
+        padding: 15px;
+    }
+    .stChatMessage[data-testid="stChatMessage-assistant"] {
+        background: #f1f3f4;
+        border-left: 4px solid #667eea;
+    }
+    .stChatMessage[data-testid="stChatMessage-user"] {
+        background: #e3f2fd;
+        border-left: 4px solid #764ba2;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<h1 class="main-header">🔬 Scientific Knowledge System</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Your AI-powered assistant for exploring scientific papers, authors, datasets, and research methods</p>', unsafe_allow_html=True)
 
     # Hardcoded settings (sidebar removed)
     ai_enabled = True
@@ -649,14 +713,24 @@ def render_sql_chat() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    st.markdown("### Suggested questions")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        qp1 = st.button("Recent papers", use_container_width=True)
-    with c2:
-        qp2 = st.button("Common publishers", use_container_width=True)
-    with c3:
-        qp3 = st.button("Methods by dataset", use_container_width=True)
+    # Enhanced suggested questions section
+    st.markdown("""
+    <div class="suggested-questions">
+    <h3>💡 Quick Start Questions</h3>
+    <p style="text-align: center; color: #666; margin-bottom: 20px;">Click any button below to get started with common queries</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("📄 **Recent Research**")
+        qp1 = st.button("Recent papers", use_container_width=True, key="recent_btn")
+    with col2:
+        st.markdown("🏢 **Publishing Trends**")
+        qp2 = st.button("Common publishers", use_container_width=True, key="publishers_btn")
+    with col3:
+        st.markdown("🧪 **Research Methods**")
+        qp3 = st.button("Methods by dataset", use_container_width=True, key="methods_btn")
 
     quick_prompt = None
     if qp1:
@@ -666,7 +740,7 @@ def render_sql_chat() -> None:
     elif qp3:
         quick_prompt = "Show methods used for datasets in the database."
 
-    user_prompt = st.chat_input("Ask about the scientific papers...")
+    user_prompt = st.chat_input("💬 Ask me anything about the scientific papers, authors, methods, or datasets...")
     if not user_prompt and not quick_prompt:
         return
     user_prompt = quick_prompt or user_prompt
@@ -759,9 +833,23 @@ def render_sql_chat() -> None:
         st.session_state["chat_messages"].append({"role": "assistant", "content": summary_text})
         _scroll_to_latest_result()
 
+    # Add a subtle footer
+    st.markdown("---")
+    st.markdown(
+        '<div style="text-align: center; color: #666; font-size: 0.8em;">'
+        'Powered by Gemini AI • Built with Streamlit • 🔬 Explore Scientific Knowledge'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
 
 def main() -> None:
-    st.set_page_config(page_title="Scientific Knowledge System", layout="centered")
+    st.set_page_config(
+        page_title="🔬 Scientific Knowledge System",
+        page_icon="🔬",
+        layout="centered",
+        initial_sidebar_state="collapsed"
+    )
     render_sql_chat()
 
 
