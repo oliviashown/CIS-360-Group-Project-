@@ -327,6 +327,20 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
     lines = [f"Here’s what I found for: **{question}**", ""]
     cols = set(df.columns.tolist())
 
+    # Determine which uncertainty types were requested
+    question_lower = question.lower()
+    requested_uncertainties = []
+    if "u1" in question_lower or "conceptual uncertainty" in question_lower:
+        requested_uncertainties.append("u1")
+    if "u2" in question_lower or "measurement uncertainty" in question_lower:
+        requested_uncertainties.append("u2")
+    if "u3" in question_lower or "algorithmic uncertainty" in question_lower:
+        requested_uncertainties.append("u3")
+    
+    # Check for "all uncertainty types" or similar phrases
+    if ("all" in question_lower and "uncertainty" in question_lower) or ("any" in question_lower and "uncertainty" in question_lower):
+        requested_uncertainties = ["u1", "u2", "u3"]
+
     if {"doi_title", "pub_date", "publisher", "field"}.issubset(cols):
         for _, row in df.head(5).iterrows():
             title = str(row.get("doi_title", "Untitled")).strip()
@@ -347,12 +361,23 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
                     lines.append(f"    - *Desc*: {row['m_desc']}")
             if "d_name" in cols and str(row.get("d_name", "")).strip():
                 lines.append(f"  - Dataset: {row['d_name']}")
-            if "u1" in cols and row.get("u1"):
-                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
-            if "u2" in cols and row.get("u2"):
-                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
-            if "u3" in cols and row.get("u3"):
-                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            # Show only the requested uncertainty types
+            if requested_uncertainties:
+                for uncertainty in requested_uncertainties:
+                    if uncertainty == "u1" and "u1" in cols and row.get("u1"):
+                        lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+                    elif uncertainty == "u2" and "u2" in cols and row.get("u2"):
+                        lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+                    elif uncertainty == "u3" and "u3" in cols and row.get("u3"):
+                        lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            else:
+                # If no specific uncertainty was requested, show all that exist
+                if "u1" in cols and row.get("u1"):
+                    lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+                if "u2" in cols and row.get("u2"):
+                    lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+                if "u3" in cols and row.get("u3"):
+                    lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
         return "\n".join(lines)
 
     if "d_name" in cols:
@@ -361,12 +386,23 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
             lines.append(f"- **{row['d_name']}**")
             if "collection_method" in cols and row["collection_method"]:
                 lines.append(f"  - Collection: {row['collection_method']}")
-            if "u2" in cols and row["u2"]:
-                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
-            if "u1" in cols and row.get("u1"):
-                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
-            if "u3" in cols and row.get("u3"):
-                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            # Show only the requested uncertainty types
+            if requested_uncertainties:
+                for uncertainty in requested_uncertainties:
+                    if uncertainty == "u2" and "u2" in cols and row.get("u2"):
+                        lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+                    elif uncertainty == "u1" and "u1" in cols and row.get("u1"):
+                        lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+                    elif uncertainty == "u3" and "u3" in cols and row.get("u3"):
+                        lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            else:
+                # If no specific uncertainty was requested, show all that exist
+                if "u2" in cols and row["u2"]:
+                    lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
+                if "u1" in cols and row.get("u1"):
+                    lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
+                if "u3" in cols and row.get("u3"):
+                    lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
             if "d_type" in cols and row["d_type"]:
                 lines.append(f"  - Type: {row['d_type']}")
         return "\n".join(lines)
@@ -529,13 +565,47 @@ def _nl_to_sql(user_text: str) -> str | None:
 
     like_conds = make_like_conditions(["doi", "d", "fm"])
 
+    # special case: papers asking about specific uncertainty types
+    uncertainty_filters = []
+    if "u1" in low or "conceptual uncertainty" in low:
+        uncertainty_filters.append("u1")
+    if "u2" in low or "measurement uncertainty" in low:
+        uncertainty_filters.append("u2")
+    if "u3" in low or "algorithmic uncertainty" in low:
+        uncertainty_filters.append("u3")
+    
+    # Check for "all uncertainty types" or similar phrases
+    if ("all" in low and "uncertainty" in low) or ("any" in low and "uncertainty" in low):
+        uncertainty_filters = ["u1", "u2", "u3"]
+
     # special case: methods used for a dataset/topic
     if intent == "methods":
-        return f"SELECT DISTINCT doi.doi_title, fm.m_name, fm.m_desc, fm.u1, fm.u3, d.d_name FROM FUSION_METHOD fm JOIN DOI doi ON fm.m_doi = doi.doi_address LEFT JOIN DATA d ON d.method_key = fm.m_key WHERE {like_conds} ORDER BY doi.pub_date DESC"
+        query = f"SELECT DISTINCT doi.doi_title, fm.m_name, fm.m_desc, fm.u1, fm.u3, d.d_name FROM FUSION_METHOD fm JOIN DOI doi ON fm.m_doi = doi.doi_address LEFT JOIN DATA d ON d.method_key = fm.m_key WHERE {like_conds}"
+        if uncertainty_filters:
+            conditions = []
+            if "u1" in uncertainty_filters:
+                conditions.append("fm.u1 IS NOT NULL")
+            if "u3" in uncertainty_filters:
+                conditions.append("fm.u3 IS NOT NULL")
+            if conditions:
+                query += f" AND ({' OR '.join(conditions)})"
+        query += " ORDER BY doi.pub_date DESC"
+        return query
 
-    # special case: papers asking about U2 / measurement uncertainty
-    if intent == "papers" and ("u2" in low or "measurement uncertainty" in low):
-        return f"SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name, fm.u1, d.u2, fm.u3 FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE d.u2 IS NOT NULL AND ({like_conds}) ORDER BY doi.pub_date DESC"
+    # special case: papers asking about uncertainty
+    if intent == "papers" and uncertainty_filters:
+        query = f"SELECT DISTINCT doi.doi_title, doi.pub_date, d.d_name, fm.u1, d.u2, fm.u3 FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE ({like_conds})"
+        conditions = []
+        if "u1" in uncertainty_filters:
+            conditions.append("fm.u1 IS NOT NULL")
+        if "u2" in uncertainty_filters:
+            conditions.append("d.u2 IS NOT NULL")
+        if "u3" in uncertainty_filters:
+            conditions.append("fm.u3 IS NOT NULL")
+        if conditions:
+            query += f" AND ({' OR '.join(conditions)})"
+        query += " ORDER BY doi.pub_date DESC"
+        return query
 
     if intent == "papers":
         return f"SELECT DISTINCT doi.doi_title, doi.pub_date, doi.publisher, doi.field, doi.abstract FROM DOI doi WHERE {make_like_conditions(['doi'])} ORDER BY doi.pub_date DESC"
@@ -825,8 +895,6 @@ def render_sql_chat() -> None:
                     summary_text, summary_err = _ollama_summarize_answer(raw, sql, df, model)
 
         if not summary_text:
-            if summary_err:
-                st.caption(f"Summary fallback: {summary_err}")
             summary_text = _fallback_summary(raw, df)
 
         st.markdown(summary_text)
