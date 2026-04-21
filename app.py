@@ -761,6 +761,19 @@ def render_sql_chat() -> None:
         raw = user_prompt.strip()
         sql = None
 
+        # Check if query seems related to database topics
+        db_keywords = {"paper", "papers", "dataset", "datasets", "author", "authors", "method", "methods", "publisher", "publishers", "fusion", "uncertainty", "u1", "u2", "u3", "doi", "abstract", "field", "recent", "common", "most", "list", "show", "which", "what", "are", "is", "the", "for", "with", "used", "report", "reporting"}
+        query_words = set(re.findall(r"[a-zA-Z]+", raw.lower()))
+        if not query_words.intersection(db_keywords):
+            response = (
+                "I'm sorry, but I can only answer questions about scientific papers, authors, datasets, methods, publishers, and related research topics in this database. "
+                "Try asking something like: 'What are the most recent papers?' or 'Which datasets are commonly fused with sensor data?'"
+            )
+            st.markdown(response)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": response})
+            _scroll_to_latest_result()
+            return
+
         if raw.lower().startswith("sql:"):
             sql = raw[4:].strip()
             if not _sql_select_only(sql):
