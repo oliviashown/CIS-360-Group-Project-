@@ -82,6 +82,20 @@ def _extract_first_json_object(text: str) -> dict | None:
         return None
 
 
+def _clean_value(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() == "nan":
+            return None
+        return stripped
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return text
+
+
 def _openai_nl_to_sql(prompt: str, schema_summary: str, model: str) -> tuple[str | None, str | None]:
     api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
     if not api_key:
@@ -332,53 +346,90 @@ def _gemini_summarize_answer(
 def _fallback_summary(question: str, df: pd.DataFrame) -> str:
     lines = [f"Here’s what I found for: **{question}**", ""]
     cols = set(df.columns.tolist())
+    question_lower = question.lower()
+    show_uncertainties = bool(re.search(r"\b(u1|u2|u3|uncertainty)\b", question_lower))
 
     if {"doi_title", "pub_date", "publisher", "field"}.issubset(cols):
         for _, row in df.head(5).iterrows():
-            title = str(row.get("doi_title", "Untitled")).strip()
-            year = str(row.get("pub_date", "N/A")).strip()
-            publisher = str(row.get("publisher", "N/A")).strip()
-            field = str(row.get("field", "N/A")).strip()
+            title = _clean_value(row.get("doi_title", "Untitled")) or "Untitled"
+            year = _clean_value(row.get("pub_date", "N/A")) or "N/A"
+            publisher = _clean_value(row.get("publisher", "N/A")) or "N/A"
+            field = _clean_value(row.get("field", "N/A")) or "N/A"
             lines.append(f"- **{title}** ({year})")
             lines.append(f"  - Publisher: {publisher}")
             lines.append(f"  - Field: {field}")
-            if "abstract" in cols and str(row.get("abstract", "")).strip():
-                abstract = str(row.get("abstract"))
+            abstract = _clean_value(row.get("abstract"))
+            if "abstract" in cols and abstract:
                 lines.append(f"  - *Abstract*: {abstract[:500]}..." if len(abstract) > 500 else f"  - *Abstract*: {abstract}")
-            if "authors" in cols and str(row.get("authors", "")).strip():
-                lines.append(f"  - Authors: {str(row.get('authors')).strip()}")
-            if "m_name" in cols and str(row.get("m_name", "")).strip():
-                lines.append(f"  - Method: {row['m_name']}")
-                if "m_desc" in cols and str(row.get("m_desc", "")).strip():
-                    lines.append(f"    - *Desc*: {row['m_desc']}")
-            if "d_name" in cols and str(row.get("d_name", "")).strip():
-                lines.append(f"  - Dataset: {row['d_name']}")
-            if "u1" in cols and row.get("u1"):
-                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
-            if "u2" in cols and row.get("u2"):
-                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
-            if "u3" in cols and row.get("u3"):
-                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
+            authors = _clean_value(row.get("authors"))
+            if "authors" in cols and authors:
+                lines.append(f"  - Authors: {authors}")
+            method_name = _clean_value(row.get("m_name"))
+            if "m_name" in cols and method_name:
+                lines.append(f"  - Method: {method_name}")
+                method_desc = _clean_value(row.get("m_desc"))
+                if "m_desc" in cols and method_desc:
+                    lines.append(f"    - *Desc*: {method_desc}")
+            dataset_name = _clean_value(row.get("d_name"))
+            if "d_name" in cols and dataset_name:
+                lines.append(f"  - Dataset: {dataset_name}")
+            if show_uncertainties:
+                u1 = _clean_value(row.get("u1"))
+                u2 = _clean_value(row.get("u2"))
+                u3 = _clean_value(row.get("u3"))
+                if "u1" in cols and u1:
+                    lines.append(f"  - **U1 (Conceptual)**: {u1}")
+                if "u2" in cols and u2:
+                    lines.append(f"  - **U2 (Measurement)**: {u2}")
+                if "u3" in cols and u3:
+                    lines.append(f"  - **U3 (Algorithmic)**: {u3}")
+        return "\n".join(lines)
+
+    if "m_name" in cols:
+        lines.append("Fusion Methods:")
+        for _, row in df.head(10).iterrows():
+            method_name = _clean_value(row.get("m_name"))
+            if method_name:
+                lines.append(f"- **{method_name}**")
+                desc = _clean_value(row.get("m_desc"))
+                if "m_desc" in cols and desc:
+                    lines.append(f"  - Description: {desc}")
+                doi_title = _clean_value(row.get("doi_title"))
+                if "doi_title" in cols and doi_title:
+                    lines.append(f"  - Paper: {doi_title}")
+                d_name = _clean_value(row.get("d_name"))
+                if "d_name" in cols and d_name:
+                    lines.append(f"  - Dataset: {d_name}")
         return "\n".join(lines)
 
     if "d_name" in cols:
         lines.append("Matching Datasets:")
         for _, row in df.head(10).iterrows():
-            lines.append(f"- **{row['d_name']}**")
-            if "source_paper" in cols and row.get("source_paper"):
-                lines.append(f"  - Paper: {row['source_paper']}")
-            if "fusion_method" in cols and row.get("fusion_method"):
-                lines.append(f"  - Fusion Method: {row['fusion_method']}")
-            if "collection_method" in cols and row["collection_method"]:
-                lines.append(f"  - Collection: {row['collection_method']}")
-            if "u2" in cols and row["u2"]:
-                lines.append(f"  - **U2 (Measurement)**: {row['u2']}")
-            if "u1" in cols and row.get("u1"):
-                lines.append(f"  - **U1 (Conceptual)**: {row['u1']}")
-            if "u3" in cols and row.get("u3"):
-                lines.append(f"  - **U3 (Algorithmic)**: {row['u3']}")
-            if "d_type" in cols and row["d_type"]:
-                lines.append(f"  - Type: {row['d_type']}")
+            dataset_name = _clean_value(row.get("d_name"))
+            source_paper = _clean_value(row.get("source_paper"))
+            fusion_method = _clean_value(row.get("fusion_method"))
+            row_label = dataset_name or fusion_method or source_paper or "Result"
+            lines.append(f"- **{row_label}**")
+            if "source_paper" in cols and source_paper:
+                lines.append(f"  - Paper: {source_paper}")
+            if "fusion_method" in cols and fusion_method:
+                lines.append(f"  - Fusion Method: {fusion_method}")
+            collection_method = _clean_value(row.get("collection_method"))
+            if "collection_method" in cols and collection_method:
+                lines.append(f"  - Collection: {collection_method}")
+            if show_uncertainties:
+                u2 = _clean_value(row.get("u2"))
+                u1 = _clean_value(row.get("u1"))
+                u3 = _clean_value(row.get("u3"))
+                if "u2" in cols and u2:
+                    lines.append(f"  - **U2 (Measurement)**: {u2}")
+                if "u1" in cols and u1:
+                    lines.append(f"  - **U1 (Conceptual)**: {u1}")
+                if "u3" in cols and u3:
+                    lines.append(f"  - **U3 (Algorithmic)**: {u3}")
+            d_type = _clean_value(row.get("d_type"))
+            if "d_type" in cols and d_type:
+                lines.append(f"  - Type: {d_type}")
         return "\n".join(lines)
 
     if "publisher" in cols and "paper_count" in cols:
@@ -389,8 +440,13 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
 
     lines.append("Top matching results:")
     for _, row in df.head(5).iterrows():
-        pairs = [f"**{k}**: {row[k]}" for k in df.columns if row[k] is not None]
-        lines.append(f"- {' | '.join(pairs)}")
+        pairs = []
+        for k in df.columns:
+            value = _clean_value(row[k])
+            if value is not None:
+                pairs.append(f"**{k}**: {value}")
+        if pairs:
+            lines.append(f"- {' | '.join(pairs)}")
     return "\n".join(lines)
 
 
@@ -468,9 +524,15 @@ def _nl_to_sql(user_text: str) -> str | None:
             "LIMIT 20;"
         )
 
+    if "all" in low and "data" in low:
+        return (
+            "SELECT d_name AS dataset_name, collection_method, u2, d_url "
+            "FROM DATA WHERE d_name IS NOT NULL ORDER BY d_name;"
+        )
+
     if ("show" in low or "list" in low) and "dataset" in low and "method" not in low and "methods" not in low and "fused with" not in low and "used with" not in low:
         return (
-            "SELECT d_name AS dataset_name, d_type, spatial_coverage, temporal_coverage, format, license "
+            "SELECT d_name AS dataset_name, collection_method, u2, d_url "
             "FROM DATA WHERE d_name IS NOT NULL ORDER BY d_name;"
         )
 
@@ -484,6 +546,16 @@ def _nl_to_sql(user_text: str) -> str | None:
                 f"WHERE a.a_doi = '{doi}' "
                 "ORDER BY a.author;"
             )
+
+    if "all" in low and "records" in low and "from" in low:
+        m = re.search(r"from\s+(\w+)", low, re.IGNORECASE)
+        if m:
+            table = m.group(1).upper()
+            if table in ["DOI", "DATA", "FUSION_METHOD", "DOI_AUTHOR"]:
+                return f"SELECT * FROM {table}"
+
+    if "all" in low and "records" in low and "every" in low and "table" in low:
+        return "SPECIAL:ALL_TABLES"
 
     # simpler keyword-based fallback for demo questions
     stopwords = {
@@ -539,13 +611,64 @@ def _nl_to_sql(user_text: str) -> str | None:
 
     like_conds = make_like_conditions(["doi", "d", "fm"])
 
+    # Detect requested uncertainty types
+    uncertainty_filters: list[str] = []
+    if "u1" in low or "conceptual uncertainty" in low:
+        uncertainty_filters.append("u1")
+    if "u2" in low or "measurement uncertainty" in low:
+        uncertainty_filters.append("u2")
+    if "u3" in low or "algorithmic uncertainty" in low:
+        uncertainty_filters.append("u3")
+    if ("all" in low and "uncertainty" in low) or ("any" in low and "uncertainty" in low):
+        uncertainty_filters = ["u1", "u2", "u3"]
+
     # special case: methods used for a dataset/topic
     if intent == "methods":
-        return f"SELECT DISTINCT doi.doi_title, fm.m_name, fm.m_desc, fm.u1, fm.u3, d.d_name FROM FUSION_METHOD fm JOIN DOI doi ON fm.m_doi = doi.doi_address LEFT JOIN DATA d ON d.method_key = fm.m_key WHERE {like_conds} ORDER BY doi.pub_date DESC"
+        select_cols = ["doi.doi_title", "fm.m_name", "fm.m_desc", "d.d_name"]
+        if "u1" in uncertainty_filters:
+            select_cols.append("fm.u1")
+        if "u3" in uncertainty_filters:
+            select_cols.append("fm.u3")
 
-    # special case: papers asking about U2 / measurement uncertainty
-    if intent == "papers" and ("u2" in low or "measurement uncertainty" in low):
-        return f"SELECT DISTINCT doi.doi_title, doi.pub_date, doi.publisher, doi.field, d.d_name, fm.u1, d.u2, fm.u3 FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key WHERE d.u2 IS NOT NULL AND ({like_conds}) ORDER BY doi.pub_date DESC"
+        query = (
+            f"SELECT DISTINCT {', '.join(select_cols)} "
+            "FROM FUSION_METHOD fm "
+            "JOIN DOI doi ON fm.m_doi = doi.doi_address "
+            "LEFT JOIN DATA d ON d.method_key = fm.m_key "
+            f"WHERE {like_conds}"
+        )
+        if uncertainty_filters:
+            conditions = []
+            if "u1" in uncertainty_filters:
+                conditions.append("fm.u1 IS NOT NULL")
+            if "u3" in uncertainty_filters:
+                conditions.append("fm.u3 IS NOT NULL")
+            if conditions:
+                query += f" AND ({' OR '.join(conditions)})"
+        query += " ORDER BY doi.pub_date DESC"
+        return query
+
+    if intent == "papers" and uncertainty_filters:
+        query = (
+            "SELECT DISTINCT doi.doi_title, doi.pub_date, doi.publisher, doi.field, d.d_name"
+            f"{', fm.u1' if 'u1' in uncertainty_filters else ''}"
+            f"{', d.u2' if 'u2' in uncertainty_filters else ''}"
+            f"{', fm.u3' if 'u3' in uncertainty_filters else ''}"
+            " FROM DATA d JOIN DOI doi ON d.d_doi = doi.doi_address "
+            "LEFT JOIN FUSION_METHOD fm ON d.method_key = fm.m_key "
+            f"WHERE ({like_conds})"
+        )
+        conditions = []
+        if "u1" in uncertainty_filters:
+            conditions.append("fm.u1 IS NOT NULL")
+        if "u2" in uncertainty_filters:
+            conditions.append("d.u2 IS NOT NULL")
+        if "u3" in uncertainty_filters:
+            conditions.append("fm.u3 IS NOT NULL")
+        if conditions:
+            query += f" AND ({' OR '.join(conditions)})"
+        query += " ORDER BY doi.pub_date DESC"
+        return query
 
     if intent == "papers":
         return f"SELECT DISTINCT doi.doi_title, doi.pub_date, doi.publisher, doi.field, doi.abstract FROM DOI doi WHERE {make_like_conditions(['doi'])} ORDER BY doi.pub_date DESC"
@@ -762,9 +885,9 @@ def render_sql_chat() -> None:
         sql = None
 
         # Check if query seems related to database topics
-        db_keywords = {"paper", "papers", "dataset", "datasets", "author", "authors", "method", "methods", "publisher", "publishers", "fusion", "uncertainty", "u1", "u2", "u3", "doi", "abstract", "field", "recent", "common", "most", "list", "show", "which", "what", "are", "is", "the", "for", "with", "used", "report", "reporting"}
+        domain_keywords = {"paper", "papers", "dataset", "datasets", "author", "authors", "method", "methods", "publisher", "publishers", "fusion", "uncertainty", "u1", "u2", "u3", "doi", "abstract", "field", "recent", "common", "most", "list", "show", "which", "used", "report", "reporting", "data"}
         query_words = set(re.findall(r"[a-zA-Z]+", raw.lower()))
-        if not query_words.intersection(db_keywords):
+        if not query_words.intersection(domain_keywords):
             response = (
                 "I'm sorry, but I can only answer questions about scientific papers, authors, datasets, methods, publishers, and related research topics in this database. "
                 "Try asking something like: 'What are the most recent papers?' or 'Which datasets are commonly fused with sensor data?'"
@@ -836,8 +959,6 @@ def render_sql_chat() -> None:
                 summary_text, summary_err = _gemini_summarize_answer(raw, sql, df, model)
 
         if not summary_text:
-            if summary_err:
-                st.caption(f"Summary fallback: {summary_err}")
             summary_text = _fallback_summary(raw, df)
 
         st.markdown(summary_text)
