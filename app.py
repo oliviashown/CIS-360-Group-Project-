@@ -348,7 +348,19 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
     cols = set(df.columns.tolist())
     question_lower = question.lower()
     show_uncertainties = bool(re.search(r"\b(u1|u2|u3|uncertainty)\b", question_lower))
+    if "dataset_name" in cols and "unique_methods_count" in cols:
+        row = df.iloc[0]
+        name = _clean_value(row.get("dataset_name"))
+        count = _clean_value(row.get("unique_methods_count"))
 
+        return f"""
+    🏆 Most popular dataset:
+
+    - **{name}**
+    - Used in **{count} methods**
+
+    This dataset appears most frequently across fusion methods in your database.
+    """
     if {"doi_title", "pub_date", "publisher", "field"}.issubset(cols):
         for _, row in df.head(5).iterrows():
             title = _clean_value(row.get("doi_title", "Untitled")) or "Untitled"
@@ -360,7 +372,7 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
             lines.append(f"  - Field: {field}")
             abstract = _clean_value(row.get("abstract"))
             if "abstract" in cols and abstract:
-                lines.append(f"  - *Abstract*: {abstract[:500]}..." if len(abstract) > 500 else f"  - *Abstract*: {abstract}")
+                lines.append(f"  - *Abstract*: {abstract}")
             authors = _clean_value(row.get("authors"))
             if "authors" in cols and authors:
                 lines.append(f"  - Authors: {authors}")
@@ -403,34 +415,31 @@ def _fallback_summary(question: str, df: pd.DataFrame) -> str:
         return "\n".join(lines)
 
     if "d_name" in cols:
-        lines.append("Matching Datasets:")
-        for _, row in df.head(10).iterrows():
-            dataset_name = _clean_value(row.get("d_name"))
-            source_paper = _clean_value(row.get("source_paper"))
-            fusion_method = _clean_value(row.get("fusion_method"))
-            row_label = dataset_name or fusion_method or source_paper or "Result"
-            lines.append(f"- **{row_label}**")
-            if "source_paper" in cols and source_paper:
-                lines.append(f"  - Paper: {source_paper}")
-            if "fusion_method" in cols and fusion_method:
-                lines.append(f"  - Fusion Method: {fusion_method}")
-            collection_method = _clean_value(row.get("collection_method"))
-            if "collection_method" in cols and collection_method:
-                lines.append(f"  - Collection: {collection_method}")
-            if show_uncertainties:
-                u2 = _clean_value(row.get("u2"))
-                u1 = _clean_value(row.get("u1"))
-                u3 = _clean_value(row.get("u3"))
-                if "u2" in cols and u2:
-                    lines.append(f"  - **U2 (Measurement)**: {u2}")
-                if "u1" in cols and u1:
-                    lines.append(f"  - **U1 (Conceptual)**: {u1}")
-                if "u3" in cols and u3:
-                    lines.append(f"  - **U3 (Algorithmic)**: {u3}")
-            d_type = _clean_value(row.get("d_type"))
-            if "d_type" in cols and d_type:
-                lines.append(f"  - Type: {d_type}")
-        return "\n".join(lines)
+        lines.append("📊 These datasets are commonly used in sensor fusion research:\n")
+
+    datasets = set()
+
+    for _, row in df.head(10).iterrows():
+        name = _clean_value(row.get("d_name"))
+        if name:
+            datasets.add(name)
+
+        # fallback if d_name missing
+        if not name:
+            name = _clean_value(row.get("fusion_method")) or _clean_value(row.get("source_paper"))
+            if name:
+                datasets.add(name)
+
+    if datasets:
+        for d in list(datasets)[:10]:
+            lines.append(f"- {d}")
+
+    lines.append(
+        "\nThese datasets are widely used in multimodal sensor fusion tasks such as RGB-D vision, "
+        "indoor scene understanding, and cross-modal learning."
+    )
+
+    return "\n".join(lines)
 
     if "publisher" in cols and "paper_count" in cols:
         lines.append("Most common publishers:")
@@ -524,11 +533,20 @@ def _nl_to_sql(user_text: str) -> str | None:
             "LIMIT 20;"
         )
 
-    if "all" in low and "data" in low:
+    if "give me all data" in low or "everything" in low:
         return (
-            "SELECT d_name AS dataset_name, collection_method, u2, d_url "
-            "FROM DATA WHERE d_name IS NOT NULL ORDER BY d_name;"
+            "SELECT d.doi_address, d.doi_title, d.pub_date, d.publisher, d.field, d.abstract, "
+            "COALESCE(GROUP_CONCAT(DISTINCT da.author), '') AS authors, "
+            "COALESCE(GROUP_CONCAT(DISTINCT fm.m_name), '') AS methods, "
+            "COALESCE(GROUP_CONCAT(DISTINCT dt.d_name), '') AS datasets "
+            "FROM DOI d "
+            "LEFT JOIN DOI_AUTHOR da ON da.a_doi = d.doi_address "
+            "LEFT JOIN FUSION_METHOD fm ON fm.m_doi = d.doi_address "
+            "LEFT JOIN DATA dt ON dt.d_doi = d.doi_address "
+            "GROUP BY d.doi_address "
+            "ORDER BY d.pub_date DESC"
         )
+        
 
     if ("show" in low or "list" in low) and "dataset" in low and "method" not in low and "methods" not in low and "fused with" not in low and "used with" not in low:
         return (
@@ -740,8 +758,24 @@ def _scroll_to_latest_result():
 
 def render_sql_chat() -> None:
     # Custom CSS for better visual appeal
+
     st.markdown("""
     <style>
+        .fixed-header {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        background: white;
+        z-index: 9999;
+        padding: 10px 0;
+        border-bottom: 1px solid #ddd;
+        text-align: center;
+        font-weight: bold;
+    }
+    body {
+        padding-top: 60px;
+    }
     .main-header {
         text-align: center;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -871,7 +905,7 @@ def render_sql_chat() -> None:
     elif qp3:
         quick_prompt = "Show methods used for datasets in the database."
 
-    user_prompt = st.chat_input("💬 Ask me anything about the scientific papers, authors, methods, or datasets...")
+    user_prompt = st.chat_input("Ask me anything about the scientific papers, authors, methods, or datasets...")
     if not user_prompt and not quick_prompt:
         return
     user_prompt = quick_prompt or user_prompt
@@ -917,7 +951,7 @@ def render_sql_chat() -> None:
                 if sql and not _sql_select_only(sql):
                     sql = _nl_to_sql(raw)
 
-                if sql:
+                if not ("all data" in raw.lower() or "everything" in raw.lower()):
                     sql = _ensure_limit(sql, int(default_limit))
             else:
                 sql = _nl_to_sql(raw)
@@ -958,27 +992,39 @@ def render_sql_chat() -> None:
             with st.spinner("Writing answer..."):
                 summary_text, summary_err = _gemini_summarize_answer(raw, sql, df, model)
 
-        if not summary_text:
-            summary_text = _fallback_summary(raw, df)
+        if "all data" in raw.lower() or "everything" in raw.lower():
+            st.markdown(f"### 📊 Showing all papers ({len(df)} rows)")
+            st.dataframe(df, use_container_width=True)
+            st.session_state["chat_messages"].append({
+                "role": "assistant",
+                "content": f"Displayed {len(df)} papers from the database."
+            })
+            _scroll_to_latest_result()
+            return
 
-        st.markdown(summary_text)
+# Otherwise normal behavior
+        if summary_text:
+            st.markdown(summary_text)
+        else:
+            summary_text = _fallback_summary(raw, df)
+            st.markdown(summary_text)  
         st.session_state["chat_messages"].append({"role": "assistant", "content": summary_text})
         _scroll_to_latest_result()
 
-    # Add a subtle footer
-    st.markdown("---")
-    st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.8em;">'
-        'Powered by Gemini AI • Built with Streamlit • 🔬 Explore Scientific Knowledge'
-        '</div>',
-        unsafe_allow_html=True
-    )
+        # Add a subtle footer
+        st.markdown("---")
+        st.markdown(
+            '<div style="text-align: center; color: #666; font-size: 0.8em;">'
+            'Powered by Gemini AI • Built with Streamlit • Explore Scientific Knowledge'
+            '</div>',
+            unsafe_allow_html=True
+        )
 
 
 def main() -> None:
     st.set_page_config(
         page_title="🔬 Scientific Knowledge System",
-        page_icon="🔬",
+        page_icon= None,
         layout="centered",
         initial_sidebar_state="collapsed"
     )
