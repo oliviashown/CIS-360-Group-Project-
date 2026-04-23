@@ -25,6 +25,7 @@ The app also tries to auto-map common variants (for example: `Method` -> `Method
 pip install -r requirements.txt
 streamlit run app.py
 ```
+or click this link to try out our chatbot : https://cis360-scientific-knowledge-system.streamlit.app/
 
 ## 3) What the UI Includes
 
